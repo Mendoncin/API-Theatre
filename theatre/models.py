@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.core.validators import MinValueValidator
 from django.db import models
 
 
@@ -51,3 +52,36 @@ class Reservation(models.Model):
 
     def __str__(self):
         return f"Reservation {self.id} - {self.user}"
+
+
+class Ticket(models.Model):
+    row = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)]
+    )
+    seat = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)]
+    )
+    performance = models.ForeignKey(
+        Performance,
+        on_delete=models.CASCADE,
+        related_name="tickets",
+    )
+    reservation = models.ForeignKey(
+        Reservation,
+        on_delete=models.CASCADE,
+        related_name="tickets",
+    )
+
+    def __str__(self):
+        return (
+            f"{self.performance.play.title} - "
+            f"Row {self.row}, Seat {self.seat}"
+        )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["performance", "row", "seat"],
+                name="unique_ticket_per_performance_seat",
+            )
+        ]
