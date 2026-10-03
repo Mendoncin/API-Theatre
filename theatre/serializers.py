@@ -48,6 +48,20 @@ class TicketSerializer(serializers.ModelSerializer):
         validators = []
 
     def validate(self, attrs):
+        request = self.context.get("request")
+        reservation = attrs.get(
+            "reservation", getattr(self.instance, "reservation", None)
+        )
+        if (
+            request
+            and request.user.is_authenticated
+            and reservation
+            and reservation.user_id != request.user.id
+        ):
+            raise serializers.ValidationError(
+                {"reservation": "You cannot add tickets to another user's reservation."}
+            )
+
         performance = attrs.get(
             "performance", getattr(self.instance, "performance", None)
         )

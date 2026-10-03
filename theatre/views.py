@@ -1,4 +1,4 @@
-from rest_framework import permissions, viewsets
+from rest_framework import mixins, permissions, viewsets
 
 from theatre.models import (
     Actor,
@@ -7,6 +7,7 @@ from theatre.models import (
     Play,
     Performance,
     Reservation,
+    Ticket,
 )
 from theatre.serializers import (
     ActorSerializer,
@@ -15,6 +16,7 @@ from theatre.serializers import (
     PlaySerializer,
     PerformanceSerializer,
     ReservationSerializer,
+    TicketSerializer,
 )
 
 
@@ -43,7 +45,13 @@ class PerformanceViewSet(viewsets.ModelViewSet):
     serializer_class = PerformanceSerializer
 
 
-class ReservationViewSet(viewsets.ModelViewSet):
+class ReservationViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
     serializer_class = ReservationSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -52,3 +60,17 @@ class ReservationViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
+
+
+class TicketViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    serializer_class = TicketSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Ticket.objects.filter(reservation__user=self.request.user)
