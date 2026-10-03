@@ -1,3 +1,4 @@
+from django.db import IntegrityError, transaction
 from rest_framework import serializers
 
 from theatre.models import Actor, Genre, TheatreHall, Play, Performance, Reservation, Ticket
@@ -44,3 +45,50 @@ class TicketSerializer(serializers.ModelSerializer):
     class Meta:
         model = Ticket
         fields = "__all__"
+        validators = []
+
+    def validate(self, attrs):
+        performance = attrs.get(
+            "performance", getattr(self.instance, "performance", None)
+        )
+        row = attrs.get("row", getattr(self.instance, "row", None))
+        seat = attrs.get("seat", getattr(self.instance, "seat", None))
+
+        hall = performance.theatre_hall
+        errors = {}
+        if row > hall.rows:
+            errors["row"] = "Row exceeds the number of rows in the theatre hall."
+        if seat > hall.seats_in_row:
+            errors["seat"] = (
+                "Seat exceeds the number of seats per row in the theatre hall."
+            )
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        tickets = Ticket.objects.filter(
+            performance=performance,
+            row=row,
+            seat=seat,
+        )
+        if self.instance:
+            tickets = tickets.exclude(pk=self.instance.pk)
+        if tickets.exists():
+            raise serializers.ValidationError(
+                "This seat is already reserved for this performance."
+            )
+        return attrs
+
+    def create(self, validated_data):
+        try:
+            with transaction.atomic():
+                return super().create(validated_data)
+        except IntegrityError:
+            if Ticket.objects.filter(
+                performance=validated_data["performance"],
+                row=validated_data["row"],
+                seat=validated_data["seat"],
+            ).exists():
+                raise serializers.ValidationError(
+                    "This seat is already reserved for this performance."
+                )
+            raise
