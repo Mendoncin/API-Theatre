@@ -1,4 +1,4 @@
-from rest_framework import viewsets
+from rest_framework import permissions, viewsets
 
 from theatre.models import (
     Actor,
@@ -6,6 +6,7 @@ from theatre.models import (
     TheatreHall,
     Play,
     Performance,
+    Reservation,
 )
 from theatre.serializers import (
     ActorSerializer,
@@ -13,6 +14,7 @@ from theatre.serializers import (
     TheatreHallSerializer,
     PlaySerializer,
     PerformanceSerializer,
+    ReservationSerializer,
 )
 
 
@@ -39,3 +41,14 @@ class PlayViewSet(viewsets.ModelViewSet):
 class PerformanceViewSet(viewsets.ModelViewSet):
     queryset = Performance.objects.all()
     serializer_class = PerformanceSerializer
+
+
+class ReservationViewSet(viewsets.ModelViewSet):
+    serializer_class = ReservationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Reservation.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
