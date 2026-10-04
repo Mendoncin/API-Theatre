@@ -61,6 +61,11 @@ class Reservation(models.Model):
         on_delete=models.CASCADE,
         related_name="reservations",
     )
+    performance = models.ForeignKey(
+        Performance,
+        on_delete=models.PROTECT,
+        related_name="reservations",
+    )
 
     def __str__(self):
         return f"Reservation {self.id} - {self.user}"

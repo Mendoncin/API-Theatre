@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
 from django.contrib.auth import get_user_model
-from django.db import IntegrityError, transaction
-from django.test import TestCase, override_settings
+from django.db import IntegrityError, connection, transaction
+from django.db.migrations.executor import MigrationExecutor
+from django.db.models.deletion import ProtectedError
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.test import APIClient
@@ -90,12 +92,16 @@ class OwnershipEndpointTests(TestCase):
     def setUpTestData(cls):
         cls.owner = get_user_model().objects.create_user(username="owner")
         cls.other = get_user_model().objects.create_user(username="other")
-        cls.reservation = Reservation.objects.create(user=cls.owner)
-        cls.foreign_reservation = Reservation.objects.create(user=cls.other)
         hall = TheatreHall.objects.create(name="Hall", rows=3, seats_in_row=5)
         play = Play.objects.create(title="Play", description="Description")
         cls.performance = Performance.objects.create(
             play=play, theatre_hall=hall, show_time=timezone.now()
+        )
+        cls.reservation = Reservation.objects.create(
+            user=cls.owner, performance=cls.performance
+        )
+        cls.foreign_reservation = Reservation.objects.create(
+            user=cls.other, performance=cls.performance
         )
         cls.ticket = Ticket.objects.create(
             row=1, seat=1, performance=cls.performance, reservation=cls.reservation
@@ -111,7 +117,7 @@ class OwnershipEndpointTests(TestCase):
 
     def payload(self, **changes):
         data = {
-            "row": 2, "seat": 3, "performance": self.performance.pk,
+            "row": 2, "seat": 3,
             "reservation": self.reservation.pk,
         }
         data.update(changes)
@@ -146,10 +152,25 @@ class OwnershipEndpointTests(TestCase):
 
     def test_reservation_creation_ignores_supplied_user(self):
         response = self.client.post(
-            "/api/theatre/reservations/", {"user": self.other.pk}, format="json"
+            "/api/theatre/reservations/",
+            {"user": self.other.pk, "performance": self.performance.pk}, format="json"
         )
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(Reservation.objects.get(pk=response.data["id"]).user_id, self.owner.pk)
+        reservation = Reservation.objects.get(pk=response.data["id"])
+        self.assertEqual(reservation.user_id, self.owner.pk)
+        self.assertEqual(reservation.performance_id, self.performance.pk)
+
+    def test_reservation_requires_performance_and_assigns_owner(self):
+        response = self.client.post("/api/theatre/reservations/", {}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("performance", response.data)
+        response = self.client.post(
+            "/api/theatre/reservations/", {"performance": self.performance.pk}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        reservation = Reservation.objects.get(pk=response.data["id"])
+        self.assertEqual(reservation.user_id, self.owner.pk)
+        self.assertEqual(reservation.performance_id, self.performance.pk)
 
     def test_ticket_creation_rejects_foreign_reservation(self):
         response = self.client.post(
@@ -163,7 +184,10 @@ class OwnershipEndpointTests(TestCase):
     def test_ticket_creation_accepts_own_reservation(self):
         response = self.client.post("/api/theatre/tickets/", self.payload(), format="json")
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(Ticket.objects.get(pk=response.data["id"]).reservation_id, self.reservation.pk)
+        ticket = Ticket.objects.get(pk=response.data["id"])
+        self.assertEqual(ticket.reservation_id, self.reservation.pk)
+        self.assertEqual(ticket.performance_id, self.reservation.performance_id)
+        self.assertEqual(response.data["performance"], self.performance.pk)
 
     def test_update_methods_are_unavailable_and_leave_objects_unchanged(self):
         for resource, obj, data in (
@@ -206,8 +230,68 @@ class OwnershipEndpointTests(TestCase):
     def test_database_constraint_rejects_duplicate_seat(self):
         with self.assertRaises(IntegrityError), transaction.atomic():
             Ticket.objects.create(
-                row=1, seat=1, performance=self.performance, reservation=self.reservation
+                row=1, seat=1, performance=self.performance, reservation=self.foreign_reservation
             )
+
+    def test_multiple_seats_in_same_reservation(self):
+        for seat in (1, 2, 3):
+            with self.subTest(seat=seat):
+                response = self.client.post(
+                    "/api/theatre/tickets/", self.payload(row=3, seat=seat), format="json"
+                )
+                self.assertEqual(response.status_code, 201)
+                ticket = Ticket.objects.get(pk=response.data["id"])
+                self.assertEqual(ticket.performance_id, self.performance.pk)
+                self.assertEqual(ticket.reservation_id, self.reservation.pk)
+
+    def test_same_seat_in_another_performance_is_allowed(self):
+        performance = Performance.objects.create(
+            play=self.performance.play, theatre_hall=self.performance.theatre_hall,
+            show_time=timezone.now(),
+        )
+        reservation = Reservation.objects.create(user=self.owner, performance=performance)
+        response = self.client.post(
+            "/api/theatre/tickets/",
+            self.payload(reservation=reservation.pk, row=1, seat=1), format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Ticket.objects.get(pk=response.data["id"]).performance_id, performance.pk)
+
+    def test_client_performance_cannot_override_reservation_or_its_hall(self):
+        large_hall = TheatreHall.objects.create(name="Large", rows=20, seats_in_row=20)
+        other_performance = Performance.objects.create(
+            play=self.performance.play, theatre_hall=large_hall, show_time=timezone.now()
+        )
+        response = self.client.post(
+            "/api/theatre/tickets/", self.payload(performance=other_performance.pk), format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Ticket.objects.get(pk=response.data["id"]).performance_id, self.performance.pk)
+        for changes, field in (({"row": 4}, "row"), ({"seat": 6}, "seat")):
+            with self.subTest(field=field):
+                response = self.client.post(
+                    "/api/theatre/tickets/",
+                    self.payload(performance=other_performance.pk, **changes), format="json",
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(field, response.data)
+        response = self.client.post(
+            "/api/theatre/tickets/",
+            self.payload(performance=other_performance.pk, row=1, seat=2), format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("This seat is already reserved", str(response.data))
+
+    def test_performance_with_reservation_is_protected_even_without_tickets(self):
+        performance = Performance.objects.create(
+            play=self.performance.play, theatre_hall=self.performance.theatre_hall,
+            show_time=timezone.now(),
+        )
+        reservation = Reservation.objects.create(user=self.owner, performance=performance)
+        self.assertEqual(list(performance.reservations.all()), [reservation])
+        with self.assertRaises(ProtectedError):
+            performance.delete()
+        self.assertTrue(Performance.objects.filter(pk=performance.pk).exists())
 
     def test_duplicate_insert_after_validation_has_friendly_error(self):
         serializer = TicketSerializer(
@@ -233,3 +317,85 @@ class OwnershipEndpointTests(TestCase):
         for resource in ("actors", "genres", "halls", "plays", "performances"):
             with self.subTest(resource=resource):
                 self.assertEqual(self.client.get(f"/api/theatre/{resource}/").status_code, 200)
+
+
+class ReservationPerformanceMigrationTests(TransactionTestCase):
+    migrate_from = [("theatre", "0002_initial")]
+    migrate_to = [("theatre", "0003_reservation_performance")]
+
+    def setUp(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_from)
+        self.apps = executor.loader.project_state(self.migrate_from).apps
+        self.addCleanup(self.restore_current_schema)
+        User = self.apps.get_model("user", "User")
+        Hall = self.apps.get_model("theatre", "TheatreHall")
+        Play = self.apps.get_model("theatre", "Play")
+        Performance = self.apps.get_model("theatre", "Performance")
+        self.Reservation = self.apps.get_model("theatre", "Reservation")
+        self.Ticket = self.apps.get_model("theatre", "Ticket")
+        user = User.objects.create(username="migration-owner")
+        hall = Hall.objects.create(name="Hall", rows=3, seats_in_row=5)
+        play = Play.objects.create(title="Play", description="Description")
+        self.performance = Performance.objects.create(
+            play=play, theatre_hall=hall, show_time=timezone.now()
+        )
+        self.other_performance = Performance.objects.create(
+            play=play, theatre_hall=hall, show_time=timezone.now()
+        )
+        self.reservation = self.Reservation.objects.create(user=user)
+        self.Ticket.objects.create(
+            reservation=self.reservation, performance=self.performance, row=1, seat=1
+        )
+        self.Ticket.objects.create(
+            reservation=self.reservation, performance=self.performance, row=1, seat=2
+        )
+
+    def restore_current_schema(self):
+        # Only the isolated test database is affected. Remove ambiguous fixtures
+        # before restoring the latest schema for Django's test teardown.
+        self.Ticket.objects.all().delete()
+        self.Reservation.objects.all().delete()
+        MigrationExecutor(connection).migrate(self.migrate_to)
+
+    def test_backfill_and_reverse_preserve_existing_data(self):
+        tickets_before = list(self.Ticket.objects.order_by("pk").values())
+        reservation_before = self.Reservation.objects.values().get(pk=self.reservation.pk)
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_to)
+        apps = executor.loader.project_state(self.migrate_to).apps
+        Reservation = apps.get_model("theatre", "Reservation")
+        reservation = Reservation.objects.get(pk=self.reservation.pk)
+        self.assertEqual(reservation.performance_id, self.performance.pk)
+        self.assertFalse(Reservation._meta.get_field("performance").null)
+        self.assertEqual(list(self.Ticket.objects.order_by("pk").values()), tickets_before)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Reservation.objects.create(user_id=reservation.user_id, performance_id=None)
+        MigrationExecutor(connection).migrate(self.migrate_from)
+        self.assertEqual(
+            self.Reservation.objects.values().get(pk=self.reservation.pk), reservation_before
+        )
+        self.assertEqual(list(self.Ticket.objects.order_by("pk").values()), tickets_before)
+
+    def assert_migration_rejected(self, message):
+        tickets_before = list(self.Ticket.objects.order_by("pk").values())
+        reservations_before = list(self.Reservation.objects.order_by("pk").values())
+        with self.assertRaisesMessage(RuntimeError, message):
+            MigrationExecutor(connection).migrate(self.migrate_to)
+        self.assertEqual(list(self.Ticket.objects.order_by("pk").values()), tickets_before)
+        self.assertEqual(list(self.Reservation.objects.order_by("pk").values()), reservations_before)
+        with connection.cursor() as cursor:
+            columns = connection.introspection.get_table_description(cursor, "theatre_reservation")
+        self.assertNotIn("performance_id", [column.name for column in columns])
+
+    def test_reservation_without_tickets_blocks_migration(self):
+        empty = self.Reservation.objects.create(user_id=self.reservation.user_id)
+        self.assert_migration_rejected(f"Reservations without tickets: [{empty.pk}]")
+
+    def test_reservation_with_multiple_performances_blocks_migration(self):
+        self.Ticket.objects.create(
+            reservation=self.reservation, performance=self.other_performance, row=1, seat=1
+        )
+        self.assert_migration_rejected(
+            f"reservations with multiple performances: [{self.reservation.pk}]"
+        )

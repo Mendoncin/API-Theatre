@@ -45,6 +45,7 @@ class TicketSerializer(serializers.ModelSerializer):
     class Meta:
         model = Ticket
         fields = "__all__"
+        read_only_fields = ("performance",)
         validators = []
 
     def validate(self, attrs):
@@ -62,9 +63,7 @@ class TicketSerializer(serializers.ModelSerializer):
                 {"reservation": "You cannot add tickets to another user's reservation."}
             )
 
-        performance = attrs.get(
-            "performance", getattr(self.instance, "performance", None)
-        )
+        performance = reservation.performance
         row = attrs.get("row", getattr(self.instance, "row", None))
         seat = attrs.get("seat", getattr(self.instance, "seat", None))
 
@@ -93,6 +92,7 @@ class TicketSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
+        validated_data["performance"] = validated_data["reservation"].performance
         try:
             with transaction.atomic():
                 return super().create(validated_data)
