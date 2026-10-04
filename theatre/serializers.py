@@ -1,5 +1,6 @@
 from django.db import IntegrityError, transaction
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import serializers
 
 from theatre.exceptions import SeatUnavailable
@@ -63,6 +64,13 @@ class ReservationCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Reservation
         fields = ("performance", "seats")
+
+    def validate_performance(self, performance):
+        if performance.show_time <= timezone.now():
+            raise serializers.ValidationError(
+                "Reservations cannot be made for past performances."
+            )
+        return performance
 
     def seats_are_occupied(self, performance, seats):
         positions = Q()

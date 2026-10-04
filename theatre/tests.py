@@ -1,3 +1,4 @@
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -265,11 +266,11 @@ class ReservationCreationTests(TestCase):
         hall = TheatreHall.objects.create(name="Hall", rows=3, seats_in_row=5)
         play = Play.objects.create(title="Play", description="Description")
         cls.performance = Performance.objects.create(
-            play=play, theatre_hall=hall, show_time=timezone.now()
+            play=play, theatre_hall=hall, show_time=timezone.now() + timedelta(days=1)
         )
         large_hall = TheatreHall.objects.create(name="Large hall", rows=10, seats_in_row=10)
         cls.other_performance = Performance.objects.create(
-            play=play, theatre_hall=large_hall, show_time=timezone.now()
+            play=play, theatre_hall=large_hall, show_time=timezone.now() + timedelta(days=1)
         )
         cls.existing_reservation = Reservation.objects.create(
             user=cls.other, performance=cls.performance
@@ -303,7 +304,8 @@ class ReservationCreationTests(TestCase):
             self.assertEqual(response.data, {"detail": SeatUnavailable.default_detail})
         return response
 
-    def test_one_seat_creates_reservation_and_ticket_for_jwt_user(self):
+    def test_future_performance_creates_reservation_and_ticket_for_jwt_user(self):
+        self.assertGreater(self.performance.show_time, timezone.now())
         before = self.counts()
         response = self.client.post(self.url, self.payload(), format="json")
         self.assertEqual(response.status_code, 201)
@@ -318,6 +320,24 @@ class ReservationCreationTests(TestCase):
         self.assertEqual(response.data["tickets"], [{"id": ticket.pk, "row": 2, "seat": 1}])
         self.assertEqual(self.client.get(f"{self.url}{reservation.pk}/").data, response.data)
         self.assertEqual(self.client.get(self.url).data, [response.data])
+
+    def test_past_performance_rejects_reservation_without_writes(self):
+        self.performance.show_time = timezone.now() - timedelta(days=1)
+        self.performance.save(update_fields=["show_time"])
+        response = self.assert_rejected_without_writes(self.payload(), 400)
+        self.assertEqual(response.data, {
+            "performance": ["Reservations cannot be made for past performances."]
+        })
+
+    def test_performance_at_exact_current_time_rejects_reservation_without_writes(self):
+        current_time = timezone.now()
+        self.performance.show_time = current_time
+        self.performance.save(update_fields=["show_time"])
+        with patch("theatre.serializers.timezone.now", return_value=current_time):
+            response = self.assert_rejected_without_writes(self.payload(), 400)
+        self.assertEqual(response.data, {
+            "performance": ["Reservations cannot be made for past performances."]
+        })
 
     def test_multiple_seats_use_server_controlled_owner_and_performance(self):
         seats = [{"row": 3, "seat": seat, "performance": self.other_performance.pk}
@@ -490,6 +510,29 @@ class PerformanceAvailabilityTests(TestCase):
             "available_count": 96,
             "occupied_seats": [],
         })
+
+    def test_past_performance_remains_public_in_catalog_and_availability(self):
+        self.performance.show_time = timezone.now() - timedelta(days=1)
+        self.performance.save(update_fields=["show_time"])
+        self.add_tickets(self.performance, [(2, 5)])
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {
+            "performance": self.performance.pk,
+            "theatre_hall": {
+                "id": self.hall.pk, "name": "Main hall", "rows": 8, "seats_in_row": 12,
+            },
+            "capacity": 96,
+            "occupied_count": 1,
+            "available_count": 95,
+            "occupied_seats": [{"row": 2, "seat": 5}],
+        })
+        detail = self.client.get(f"/api/theatre/performances/{self.performance.pk}/")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data["id"], self.performance.pk)
+        listing = self.client.get("/api/theatre/performances/")
+        self.assertEqual(listing.status_code, 200)
+        self.assertIn(self.performance.pk, [item["id"] for item in listing.data])
 
     def test_tickets_from_multiple_reservations_are_sorted_without_changing_data(self):
         self.add_tickets(self.performance, [(4, 8), (1, 7), (2, 2)])
