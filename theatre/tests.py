@@ -129,8 +129,8 @@ class PerformanceDeletionTests(TestCase):
                 self.assertEqual(response.status_code, 409)
                 self.assertEqual(response.data, {
                     "detail": (
-                        "This performance cannot be deleted "
-                        "because it has existing reservations."
+                        "This resource cannot be deleted "
+                        "because it has protected related data."
                     )
                 })
                 self.assertTrue(Performance.objects.filter(pk=self.performance.pk).exists())
@@ -151,6 +151,69 @@ class PerformanceDeletionTests(TestCase):
                 self.assertEqual(self.client.delete(self.url).status_code, expected)
                 self.assertTrue(Performance.objects.filter(pk=self.performance.pk).exists())
                 self.assertTrue(Reservation.objects.filter(pk=reservation.pk).exists())
+
+
+@override_settings(ALLOWED_HOSTS=["testserver"])
+class CatalogParentDeletionTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.staff = get_user_model().objects.create_user(
+            username="parent-deletion-staff", is_staff=True, is_superuser=False
+        )
+        cls.owner = get_user_model().objects.create_user(username="parent-deletion-owner")
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.staff)
+
+    def make_tree(self, resource, count):
+        hall = TheatreHall.objects.create(name="Hall", rows=3, seats_in_row=5)
+        play = Play.objects.create(title="Play", description="Description")
+        performances = [
+            Performance.objects.create(
+                play=play, theatre_hall=hall, show_time=timezone.now() + timedelta(days=1)
+            )
+            for _ in range(count)
+        ]
+        parent = play if resource == "plays" else hall
+        return parent, performances
+
+    def test_unprotected_parent_deletion_cascades_to_performances(self):
+        for resource in ("plays", "halls"):
+            with self.subTest(resource=resource):
+                parent, performances = self.make_tree(resource, 3)
+                response = self.client.delete(f"/api/theatre/{resource}/{parent.pk}/")
+                self.assertEqual(response.status_code, 204)
+                self.assertFalse(type(parent).objects.filter(pk=parent.pk).exists())
+                self.assertFalse(Performance.objects.filter(
+                    pk__in=[performance.pk for performance in performances]
+                ).exists())
+
+    def test_protected_parent_preserves_entire_tree(self):
+        for resource in ("plays", "halls"):
+            for count in (1, 3):
+                with self.subTest(resource=resource, performances=count):
+                    parent, performances = self.make_tree(resource, count)
+                    # Only the last Performance is protected. Earlier siblings
+                    # must survive too, rather than being partially cascaded away.
+                    reservation = Reservation.objects.create(
+                        user=self.owner, performance=performances[-1]
+                    )
+                    Ticket.objects.create(
+                        reservation=reservation, performance=performances[-1], row=1, seat=1
+                    )
+                    models = (Play, TheatreHall, Performance, Reservation, Ticket)
+                    before = [list(model.objects.order_by("pk").values()) for model in models]
+                    response = self.client.delete(f"/api/theatre/{resource}/{parent.pk}/")
+                    self.assertEqual(response.status_code, 409)
+                    self.assertEqual(response.data, {
+                        "detail": (
+                            "This resource cannot be deleted "
+                            "because it has protected related data."
+                        )
+                    })
+                    after = [list(model.objects.order_by("pk").values()) for model in models]
+                    self.assertEqual(after, before)
 
 
 @override_settings(ALLOWED_HOSTS=["testserver"])

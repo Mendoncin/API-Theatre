@@ -30,6 +30,25 @@ from theatre.serializers import (
 )
 
 
+class ProtectedDeleteMixin:
+    protected_delete_message = (
+        "This resource cannot be deleted because it has protected related data."
+    )
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+
+        try:
+            self.perform_destroy(instance)
+        except ProtectedError:
+            return Response(
+                {"detail": self.protected_delete_message},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class ActorViewSet(viewsets.ModelViewSet):
     queryset = Actor.objects.all()
     serializer_class = ActorSerializer
@@ -42,19 +61,19 @@ class GenreViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAdminOrReadOnly]
 
 
-class TheatreHallViewSet(viewsets.ModelViewSet):
+class TheatreHallViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = TheatreHall.objects.all()
     serializer_class = TheatreHallSerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
-class PlayViewSet(viewsets.ModelViewSet):
+class PlayViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Play.objects.all()
     serializer_class = PlaySerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
-class PerformanceViewSet(viewsets.ModelViewSet):
+class PerformanceViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Performance.objects.all()
     serializer_class = PerformanceSerializer
     permission_classes = [IsAdminOrReadOnly]
@@ -83,24 +102,6 @@ class PerformanceViewSet(viewsets.ModelViewSet):
             "available_count": capacity - occupied_count,
             "occupied_seats": occupied_seats,
         })
-
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-
-        try:
-            self.perform_destroy(instance)
-        except ProtectedError:
-            return Response(
-                {
-                    "detail": (
-                        "This performance cannot be deleted "
-                        "because it has existing reservations."
-                    )
-                },
-                status=status.HTTP_409_CONFLICT,
-            )
-
-        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ReservationViewSet(
