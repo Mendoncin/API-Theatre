@@ -19,6 +19,7 @@ from theatre.serializers import (
     TheatreHallSerializer,
     PlaySerializer,
     PerformanceSerializer,
+    ReservationCreateSerializer,
     ReservationSerializer,
     TicketSerializer,
 )
@@ -82,15 +83,28 @@ class ReservationViewSet(
     serializer_class = ReservationSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def get_serializer_class(self):
+        if self.action == "create":
+            return ReservationCreateSerializer
+        return ReservationSerializer
+
     def get_queryset(self):
-        return Reservation.objects.filter(user=self.request.user)
+        return Reservation.objects.filter(user=self.request.user).prefetch_related("tickets")
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        data = ReservationSerializer(
+            serializer.instance, context=self.get_serializer_context()
+        ).data
+        return Response(data, status=status.HTTP_201_CREATED, headers=self.get_success_headers(data))
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
 
 class TicketViewSet(
-    mixins.CreateModelMixin,
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
     mixins.DestroyModelMixin,
