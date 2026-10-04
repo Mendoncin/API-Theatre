@@ -1,5 +1,6 @@
 from django.db.models.deletion import ProtectedError
 from rest_framework import mixins, permissions, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from theatre.permissions import IsAdminOrReadOnly
@@ -53,6 +54,31 @@ class PerformanceViewSet(viewsets.ModelViewSet):
     queryset = Performance.objects.all()
     serializer_class = PerformanceSerializer
     permission_classes = [IsAdminOrReadOnly]
+
+    @action(detail=True, methods=["get"], url_path="availability")
+    def availability(self, request, pk=None):
+        performance = self.get_object()
+        hall = performance.theatre_hall
+        occupied_seats = list(
+            Ticket.objects.filter(performance=performance)
+            .order_by("row", "seat")
+            .values("row", "seat")
+        )
+        capacity = hall.rows * hall.seats_in_row
+        occupied_count = len(occupied_seats)
+        return Response({
+            "performance": performance.pk,
+            "theatre_hall": {
+                "id": hall.pk,
+                "name": hall.name,
+                "rows": hall.rows,
+                "seats_in_row": hall.seats_in_row,
+            },
+            "capacity": capacity,
+            "occupied_count": occupied_count,
+            "available_count": capacity - occupied_count,
+            "occupied_seats": occupied_seats,
+        })
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
