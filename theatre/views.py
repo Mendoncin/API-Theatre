@@ -1,8 +1,12 @@
+from django.db import transaction
 from django.db.models.deletion import ProtectedError
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
+from theatre.exceptions import CancellationNotAllowed
 from theatre.permissions import IsAdminOrReadOnly
 
 from theatre.models import (
@@ -129,6 +133,16 @@ class ReservationViewSet(
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            reservation = get_object_or_404(
+                Reservation.objects.select_for_update(),
+                pk=instance.pk, user=self.request.user,
+            )
+            if reservation.performance.show_time <= timezone.now():
+                raise CancellationNotAllowed()
+            reservation.delete()
+
 
 class TicketViewSet(
     mixins.ListModelMixin,
@@ -141,3 +155,15 @@ class TicketViewSet(
 
     def get_queryset(self):
         return Ticket.objects.filter(reservation__user=self.request.user)
+
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            reservation = get_object_or_404(
+                Reservation.objects.select_for_update(),
+                pk=instance.reservation_id, user=self.request.user,
+            )
+            if reservation.performance.show_time <= timezone.now():
+                raise CancellationNotAllowed()
+            instance.delete()
+            if not reservation.tickets.exists():
+                reservation.delete()

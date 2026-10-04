@@ -5,12 +5,13 @@ from django.contrib.auth import get_user_model
 from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.db.models.deletion import ProtectedError
+from django.db.models.query import QuerySet
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import AccessToken
 
-from theatre.exceptions import SeatUnavailable
+from theatre.exceptions import CancellationNotAllowed, SeatUnavailable
 from theatre.models import Actor, Genre, Performance, Play, Reservation, TheatreHall, Ticket
 from theatre.views import ReservationViewSet
 
@@ -228,6 +229,11 @@ class OwnershipEndpointTests(TestCase):
                     self.assertEqual(type(obj).objects.values().get(pk=obj.pk), before)
 
     def test_owner_can_delete_ticket_and_reservation(self):
+        self.performance.show_time = timezone.now() + timedelta(days=1)
+        self.performance.save(update_fields=["show_time"])
+        Ticket.objects.create(
+            reservation=self.reservation, performance=self.performance, row=2, seat=1
+        )
         for resource, obj in (("tickets", self.ticket), ("reservations", self.reservation)):
             response = self.client.delete(f"/api/theatre/{resource}/{obj.pk}/")
             self.assertEqual(response.status_code, 204)
@@ -587,6 +593,8 @@ class PerformanceAvailabilityTests(TestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_owner_ticket_deletion_is_reflected_in_next_public_query(self):
+        self.performance.show_time = timezone.now() + timedelta(days=1)
+        self.performance.save(update_fields=["show_time"])
         tickets = self.add_tickets(self.performance, [(2, 4), (2, 5)])
         before = self.client.get(self.url)
         self.assertEqual(before.status_code, 200)
@@ -608,6 +616,174 @@ class PerformanceAvailabilityTests(TestCase):
             with self.subTest(method=method):
                 self.assertEqual(getattr(self.client, method)(self.url).status_code, 405)
         self.assertTrue(Performance.objects.filter(pk=self.performance.pk).exists())
+
+
+@override_settings(ALLOWED_HOSTS=["testserver"])
+class CancellationTests(TransactionTestCase):
+    def setUp(self):
+        self.owner = get_user_model().objects.create_user(username="cancellation-owner")
+        self.other = get_user_model().objects.create_user(username="cancellation-other")
+        hall = TheatreHall.objects.create(name="Hall", rows=2, seats_in_row=3)
+        play = Play.objects.create(title="Play", description="Description")
+        self.performance = Performance.objects.create(
+            play=play, theatre_hall=hall, show_time=timezone.now() + timedelta(days=1)
+        )
+        self.client = APIClient()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {AccessToken.for_user(self.owner)}")
+        self.availability_url = f"/api/theatre/performances/{self.performance.pk}/availability/"
+
+    def make_reservation(self, count=3):
+        reservation = Reservation.objects.create(user=self.owner, performance=self.performance)
+        tickets = [Ticket.objects.create(
+            reservation=reservation, performance=self.performance, row=1, seat=seat
+        ) for seat in range(1, count + 1)]
+        return reservation, tickets
+
+    def test_partial_cancellation_preserves_other_seats_and_updates_availability(self):
+        reservation, tickets = self.make_reservation()
+        before = self.client.get(self.availability_url).data
+        response = self.client.delete(f"/api/theatre/tickets/{tickets[1].pk}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertTrue(Reservation.objects.filter(pk=reservation.pk).exists())
+        self.assertCountEqual(reservation.tickets.values_list("pk", flat=True),
+                              [tickets[0].pk, tickets[2].pk])
+        after = self.client.get(self.availability_url).data
+        self.assertEqual(after["occupied_count"], before["occupied_count"] - 1)
+        self.assertEqual(after["available_count"], before["available_count"] + 1)
+        self.assertEqual(after["occupied_seats"], [{"row": 1, "seat": 1}, {"row": 1, "seat": 3}])
+
+    def test_last_ticket_removes_reservation(self):
+        reservation, tickets = self.make_reservation(1)
+        response = self.client.delete(f"/api/theatre/tickets/{tickets[0].pk}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Ticket.objects.filter(pk=tickets[0].pk).exists())
+        self.assertFalse(Reservation.objects.filter(pk=reservation.pk).exists())
+
+    def test_integral_cancellation_cascades_and_releases_all_seats(self):
+        reservation, tickets = self.make_reservation()
+        before = self.client.get(self.availability_url).data
+        response = self.client.delete(f"/api/theatre/reservations/{reservation.pk}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Reservation.objects.filter(pk=reservation.pk).exists())
+        self.assertFalse(Ticket.objects.filter(pk__in=[t.pk for t in tickets]).exists())
+        after = self.client.get(self.availability_url).data
+        self.assertEqual(after["occupied_count"], before["occupied_count"] - 3)
+        self.assertEqual(after["available_count"], before["available_count"] + 3)
+        self.assertEqual(after["occupied_seats"], [])
+
+    def test_anonymous_and_other_user_cannot_cancel(self):
+        reservation, tickets = self.make_reservation()
+        for user, expected in ((None, 401), (self.other, 404)):
+            self.client.credentials()
+            if user:
+                self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {AccessToken.for_user(user)}")
+            for resource, pk in (("tickets", tickets[0].pk), ("reservations", reservation.pk)):
+                with self.subTest(user=user, resource=resource):
+                    response = self.client.delete(f"/api/theatre/{resource}/{pk}/")
+                    self.assertEqual(response.status_code, expected)
+                    self.assertTrue(Reservation.objects.filter(pk=reservation.pk).exists())
+                    self.assertEqual(reservation.tickets.count(), 3)
+
+    def test_past_and_exact_start_block_both_deletes_but_allow_history(self):
+        reservation, tickets = self.make_reservation()
+        current_time = timezone.now()
+        for show_time in (current_time - timedelta(days=1), current_time):
+            self.performance.show_time = show_time
+            self.performance.save(update_fields=["show_time"])
+            with patch("theatre.views.timezone.now", return_value=current_time):
+                for resource, pk in (("tickets", tickets[0].pk), ("reservations", reservation.pk)):
+                    with self.subTest(show_time=show_time, resource=resource):
+                        url = f"/api/theatre/{resource}/{pk}/"
+                        response = self.client.delete(url)
+                        self.assertEqual(response.status_code, 409)
+                        self.assertEqual(response.data, {"detail": CancellationNotAllowed.default_detail})
+                        self.assertTrue(Reservation.objects.filter(pk=reservation.pk).exists())
+                        self.assertEqual(reservation.tickets.count(), 3)
+                        self.assertEqual(self.client.get(url).status_code, 200)
+                        listing = self.client.get(f"/api/theatre/{resource}/")
+                        self.assertEqual(listing.status_code, 200)
+                        self.assertIn(pk, [item["id"] for item in listing.data])
+
+    def test_last_ticket_deletion_rolls_back_if_reservation_deletion_fails(self):
+        reservation, tickets = self.make_reservation(1)
+
+        def fail_delete(instance, *args, **kwargs):
+            self.assertTrue(connection.in_atomic_block)
+            self.assertFalse(Ticket.objects.filter(reservation=instance).exists())
+            raise RuntimeError("Deletion failed")
+
+        with patch.object(Reservation, "delete", fail_delete):
+            with self.assertRaisesMessage(RuntimeError, "Deletion failed"):
+                self.client.delete(f"/api/theatre/tickets/{tickets[0].pk}/")
+        self.assertTrue(Reservation.objects.filter(pk=reservation.pk).exists())
+        self.assertTrue(Ticket.objects.filter(pk=tickets[0].pk).exists())
+
+    def test_reservation_lock_covers_both_last_ticket_decisions_and_integral_delete(self):
+        reservation, tickets = self.make_reservation(2)
+        locked_queryset = Reservation.objects.select_for_update()
+        get_locked = locked_queryset.get
+        delete_ticket = Ticket.delete
+        delete_reservation = Reservation.delete
+        exists = QuerySet.exists
+        events = []
+
+        def request_lock():
+            self.assertTrue(connection.in_atomic_block)
+            self.assertTrue(locked_queryset.query.select_for_update)
+            return locked_queryset
+
+        def acquire_lock(*args, **kwargs):
+            self.assertTrue(connection.in_atomic_block)
+            result = get_locked(*args, **kwargs)
+            self.assertEqual(result.pk, reservation.pk)
+            events.append("lock")
+            return result
+
+        def track_ticket_delete(instance, *args, **kwargs):
+            self.assertTrue(connection.in_atomic_block)
+            self.assertEqual(events, ["lock"])
+            events.append("ticket")
+            return delete_ticket(instance, *args, **kwargs)
+
+        def track_exists(queryset):
+            if queryset.model is Ticket:
+                self.assertTrue(connection.in_atomic_block)
+                self.assertEqual(events, ["lock", "ticket"])
+                events.append("remaining")
+            return exists(queryset)
+
+        def track_reservation_delete(instance, *args, **kwargs):
+            self.assertTrue(connection.in_atomic_block)
+            self.assertEqual(events[0], "lock")
+            events.append("reservation")
+            return delete_reservation(instance, *args, **kwargs)
+
+        # TransactionTestCase leaves autocommit enabled outside each API call.
+        self.assertFalse(connection.in_atomic_block)
+        with (
+            patch.object(Reservation.objects, "select_for_update", side_effect=request_lock),
+            patch.object(locked_queryset, "get", side_effect=acquire_lock),
+            patch.object(Ticket, "delete", track_ticket_delete),
+            patch.object(Reservation, "delete", track_reservation_delete),
+            patch.object(QuerySet, "exists", track_exists),
+        ):
+            for index, ticket in enumerate(tickets):
+                events.clear()
+                response = self.client.delete(f"/api/theatre/tickets/{ticket.pk}/")
+                self.assertEqual(response.status_code, 204)
+                expected = ["lock", "ticket", "remaining"]
+                if index == 1:
+                    expected.append("reservation")
+                self.assertEqual(events, expected)
+                self.assertFalse(connection.in_atomic_block)
+                self.assertEqual(Reservation.objects.filter(pk=reservation.pk).count(), 1 - index)
+                self.assertEqual(Ticket.objects.filter(reservation_id=reservation.pk).count(), 1 - index)
+            reservation, _ = self.make_reservation(2)
+            events.clear()
+            response = self.client.delete(f"/api/theatre/reservations/{reservation.pk}/")
+            self.assertEqual(response.status_code, 204)
+            self.assertEqual(events, ["lock", "reservation"])
+        self.assertFalse(connection.in_atomic_block)
 
 
 class ReservationPerformanceMigrationTests(TransactionTestCase):
