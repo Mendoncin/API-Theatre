@@ -25,16 +25,59 @@ class TheatreHallSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
-class PlaySerializer(serializers.ModelSerializer):
+class PlaySummarySerializer(serializers.ModelSerializer):
     class Meta:
         model = Play
-        fields = "__all__"
+        fields = ("id", "title")
+        read_only_fields = fields
+
+
+class PlayListSerializer(serializers.ModelSerializer):
+    genres = GenreSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Play
+        fields = ("id", "title", "genres")
+        read_only_fields = fields
+
+
+class PlayDetailSerializer(serializers.ModelSerializer):
+    genres = GenreSerializer(many=True, read_only=True)
+    actors = ActorSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Play
+        fields = ("id", "title", "description", "genres", "actors")
+        read_only_fields = fields
+
+
+class PlayWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Play
+        fields = ("id", "title", "description", "actors", "genres")
+
+
+class TheatreHallSummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TheatreHall
+        fields = ("id", "name")
+        read_only_fields = fields
 
 
 class PerformanceSerializer(serializers.ModelSerializer):
+    play = PlaySummarySerializer(read_only=True)
+    theatre_hall = TheatreHallSummarySerializer(read_only=True)
+
     class Meta:
         model = Performance
-        fields = "__all__"
+        fields = ("id", "play", "theatre_hall", "show_time")
+        read_only_fields = fields
+
+
+class PerformanceWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Performance
+        fields = ("id", "play", "theatre_hall", "show_time")
 
 
 class ReservationTicketSerializer(serializers.ModelSerializer):
@@ -45,6 +88,7 @@ class ReservationTicketSerializer(serializers.ModelSerializer):
 
 
 class ReservationSerializer(serializers.ModelSerializer):
+    performance = PerformanceSerializer(read_only=True)
     tickets = ReservationTicketSerializer(many=True, read_only=True)
 
     class Meta:

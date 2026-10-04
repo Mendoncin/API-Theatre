@@ -12,6 +12,7 @@ from django.db.migrations.executor import MigrationExecutor
 from django.db.models.deletion import ProtectedError
 from django.db.models.query import QuerySet
 from django.test import TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import AccessToken
@@ -92,6 +93,144 @@ class CatalogPermissionTests(TestCase):
                 self.assertEqual(self.client.put(detail, payload, format="json").status_code, 200)
                 self.assertEqual(self.client.patch(detail, payload, format="json").status_code, 200)
                 self.assertEqual(self.client.delete(detail).status_code, 204)
+
+
+@override_settings(ALLOWED_HOSTS=["testserver"])
+class RepresentationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = get_user_model().objects.create_user(username="representation-owner")
+        self.staff = get_user_model().objects.create_user(
+            username="representation-staff", is_staff=True
+        )
+        self.actor = Actor.objects.create(first_name="Test", last_name="Actor")
+        self.genre = Genre.objects.create(name="Drama")
+        self.performance, self.reservation, self.ticket = self.make_bundle()
+
+    def make_bundle(self):
+        play = Play.objects.create(title="Play", description="Full description")
+        play.actors.add(self.actor)
+        play.genres.add(self.genre)
+        hall = TheatreHall.objects.create(name="Hall", rows=3, seats_in_row=5)
+        performance = Performance.objects.create(
+            play=play, theatre_hall=hall, show_time=timezone.now() + timedelta(days=7)
+        )
+        reservation = Reservation.objects.create(user=self.owner, performance=performance)
+        ticket = Ticket.objects.create(
+            reservation=reservation, performance=performance, row=1, seat=1
+        )
+        return performance, reservation, ticket
+
+    def assert_performance_representation(self, data):
+        self.assertEqual(set(data), {"id", "show_time", "play", "theatre_hall"})
+        self.assertEqual(data["id"], self.performance.pk)
+        self.assertEqual(data["play"], {"id": self.performance.play_id, "title": "Play"})
+        self.assertEqual(data["theatre_hall"], {
+            "id": self.performance.theatre_hall_id, "name": "Hall",
+        })
+        self.assertEqual(
+            timezone.datetime.fromisoformat(data["show_time"].replace("Z", "+00:00")),
+            self.performance.show_time,
+        )
+
+    def test_play_list_and_detail_have_distinct_bounded_representations(self):
+        summary = {
+            "id": self.performance.play_id, "title": "Play",
+            "genres": [{"id": self.genre.pk, "name": "Drama"}],
+        }
+        response = self.client.get("/api/theatre/plays/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [summary])
+        response = self.client.get(f"/api/theatre/plays/{self.performance.play_id}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {
+            **summary, "description": "Full description",
+            "actors": [{"id": self.actor.pk, "first_name": "Test", "last_name": "Actor"}],
+        })
+
+    def test_performance_list_and_detail_share_summary_representation(self):
+        response = self.client.get("/api/theatre/performances/")
+        self.assertEqual(response.status_code, 200)
+        self.assert_performance_representation(response.data[0])
+        detail = self.client.get(f"/api/theatre/performances/{self.performance.pk}/")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data, response.data[0])
+
+    def test_reservation_create_list_and_detail_use_enriched_read_representation(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post("/api/theatre/reservations/", {
+            "performance": self.performance.pk, "seats": [{"row": 2, "seat": 3}],
+        }, format="json")
+        self.assertEqual(response.status_code, 201)
+        data = response.data
+        self.assertEqual(set(data), {"id", "created_at", "user", "performance", "tickets"})
+        self.assertEqual(data["user"], self.owner.pk)
+        self.assert_performance_representation(data["performance"])
+        ticket = Ticket.objects.get(reservation_id=data["id"])
+        self.assertEqual(data["tickets"], [{"id": ticket.pk, "row": 2, "seat": 3}])
+        detail = self.client.get(f"/api/theatre/reservations/{data['id']}/")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data, data)
+        listing = self.client.get("/api/theatre/reservations/")
+        self.assertEqual(listing.status_code, 200)
+        self.assertIn(data, listing.data)
+        for item in listing.data:
+            self.assert_performance_representation(item["performance"])
+            self.assertTrue(item["tickets"])
+            self.assertEqual(set(item["tickets"][0]), {"id", "row", "seat"})
+
+    def test_catalog_writes_accept_ids_and_reject_nested_objects(self):
+        self.client.force_authenticate(self.staff)
+        payloads = {
+            "plays": {
+                "title": "New", "description": "Description",
+                "actors": [self.actor.pk], "genres": [self.genre.pk],
+            },
+            "performances": {
+                "play": self.performance.play_id,
+                "theatre_hall": self.performance.theatre_hall_id,
+                "show_time": self.performance.show_time.isoformat(),
+            },
+        }
+        relations = {"plays": ("actors", "genres"), "performances": ("play", "theatre_hall")}
+        for resource, payload in payloads.items():
+            with self.subTest(resource=resource):
+                base = f"/api/theatre/{resource}/"
+                response = self.client.post(base, payload, format="json")
+                self.assertEqual(response.status_code, 201)
+                url = f"{base}{response.data['id']}/"
+                for method in ("put", "patch"):
+                    response = getattr(self.client, method)(url, payload, format="json")
+                    self.assertEqual(response.status_code, 200)
+                    for field in relations[resource]:
+                        self.assertEqual(response.data[field], payload[field])
+                for field in relations[resource]:
+                    value = payload[field]
+                    nested = [{"id": pk} for pk in value] if isinstance(value, list) else {"id": value}
+                    for method, target in (("post", base), ("put", url), ("patch", url)):
+                        response = getattr(self.client, method)(
+                            target, {**payload, field: nested}, format="json"
+                        )
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn(field, response.data)
+
+    def test_list_queries_do_not_grow_with_related_objects(self):
+        self.client.force_authenticate(self.owner)
+        # Authentication is forced; fixture writes are outside measurement.
+        # Play: base SELECT + genres prefetch. Performance: one joined SELECT.
+        # Reservation: one joined SELECT + tickets prefetch.
+        expected_queries = {"plays": 2, "performances": 1, "reservations": 2}
+        for count in (1, 4):
+            if count == 4:
+                for _ in range(3):
+                    self.make_bundle()
+            for resource, expected in expected_queries.items():
+                with self.subTest(resource=resource, count=count):
+                    with CaptureQueriesContext(connection) as queries:
+                        response = self.client.get(f"/api/theatre/{resource}/")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(len(response.data), count)
+                    self.assertEqual(len(queries), expected, [q["sql"] for q in queries])
 
 
 @override_settings(ALLOWED_HOSTS=["testserver"])

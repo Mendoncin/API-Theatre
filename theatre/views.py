@@ -22,8 +22,11 @@ from theatre.serializers import (
     ActorSerializer,
     GenreSerializer,
     TheatreHallSerializer,
-    PlaySerializer,
+    PlayListSerializer,
+    PlayDetailSerializer,
+    PlayWriteSerializer,
     PerformanceSerializer,
+    PerformanceWriteSerializer,
     ReservationCreateSerializer,
     ReservationSerializer,
     TicketSerializer,
@@ -69,14 +72,40 @@ class TheatreHallViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
 
 class PlayViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Play.objects.all()
-    serializer_class = PlaySerializer
+    serializer_class = PlayWriteSerializer
     permission_classes = [IsAdminOrReadOnly]
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return PlayListSerializer
+        if self.action == "retrieve":
+            return PlayDetailSerializer
+        return PlayWriteSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action == "list":
+            return queryset.prefetch_related("genres")
+        if self.action == "retrieve":
+            return queryset.prefetch_related("genres", "actors")
+        return queryset
 
 
 class PerformanceViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Performance.objects.all()
     serializer_class = PerformanceSerializer
     permission_classes = [IsAdminOrReadOnly]
+
+    def get_serializer_class(self):
+        if self.action in ("create", "update", "partial_update"):
+            return PerformanceWriteSerializer
+        return PerformanceSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action in ("list", "retrieve"):
+            return queryset.select_related("play", "theatre_hall")
+        return queryset
 
     @action(detail=True, methods=["get"], url_path="availability")
     def availability(self, request, pk=None):
@@ -120,7 +149,9 @@ class ReservationViewSet(
         return ReservationSerializer
 
     def get_queryset(self):
-        return Reservation.objects.filter(user=self.request.user).prefetch_related("tickets")
+        return Reservation.objects.filter(user=self.request.user).select_related(
+            "performance__play", "performance__theatre_hall",
+        ).prefetch_related("tickets")
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
