@@ -7,8 +7,81 @@ from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.test import APIClient
 
-from theatre.models import Performance, Play, Reservation, TheatreHall, Ticket
+from theatre.models import Actor, Genre, Performance, Play, Reservation, TheatreHall, Ticket
 from theatre.serializers import TicketSerializer
+
+
+@override_settings(ALLOWED_HOSTS=["testserver"])
+class CatalogPermissionTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.regular = get_user_model().objects.create_user(username="catalog-reader")
+        cls.staff = get_user_model().objects.create_user(
+            username="catalog-staff", is_staff=True, is_superuser=False
+        )
+        cls.actor = Actor.objects.create(first_name="Test", last_name="Actor")
+        genre = Genre.objects.create(name="Drama")
+        hall = TheatreHall.objects.create(name="Hall", rows=3, seats_in_row=5)
+        play = Play.objects.create(title="Play", description="Description")
+        performance = Performance.objects.create(
+            play=play, theatre_hall=hall, show_time=timezone.now()
+        )
+        cls.resources = (
+            ("actors", cls.actor, {"first_name": "New", "last_name": "Actor"}),
+            ("genres", genre, {"name": "Comedy"}),
+            ("halls", hall, {"name": "New hall", "rows": 2, "seats_in_row": 4}),
+            ("plays", play, {"title": "New play", "description": "Description",
+                             "actors": [cls.actor.pk], "genres": [genre.pk]}),
+            ("performances", performance, {"play": play.pk, "theatre_hall": hall.pk,
+                                           "show_time": timezone.now().isoformat()}),
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_safe_methods_are_public_on_all_catalog_resources(self):
+        for resource, obj, _ in self.resources:
+            for url in (f"/api/theatre/{resource}/", f"/api/theatre/{resource}/{obj.pk}/"):
+                for method in ("get", "head", "options"):
+                    with self.subTest(url=url, method=method):
+                        self.assertEqual(getattr(self.client, method)(url).status_code, 200)
+
+    def test_all_catalog_resources_reject_nonstaff_creation(self):
+        for user, expected in ((None, 401), (self.regular, 403)):
+            self.client.force_authenticate(user)
+            for resource, _, payload in self.resources:
+                with self.subTest(user=user, resource=resource):
+                    response = self.client.post(f"/api/theatre/{resource}/", payload, format="json")
+                    self.assertEqual(response.status_code, expected)
+
+    def test_actor_nonstaff_read_and_write_permissions(self):
+        base = "/api/theatre/actors/"
+        detail = f"{base}{self.actor.pk}/"
+        payload = {"first_name": "Changed", "last_name": "Actor"}
+        for user, expected in ((None, 401), (self.regular, 403)):
+            self.client.force_authenticate(user)
+            self.assertEqual(self.client.get(detail).status_code, 200)
+            for method in ("put", "patch", "delete"):
+                with self.subTest(user=user, method=method):
+                    self.assertEqual(
+                        getattr(self.client, method)(detail, payload, format="json").status_code,
+                        expected,
+                    )
+        self.actor.refresh_from_db()
+        self.assertEqual(self.actor.first_name, "Test")
+
+    def test_staff_without_superuser_can_manage_catalog(self):
+        self.client.force_authenticate(self.staff)
+        for resource, _, payload in self.resources:
+            base = f"/api/theatre/{resource}/"
+            with self.subTest(resource=resource):
+                self.assertEqual(self.client.get(base).status_code, 200)
+                response = self.client.post(base, payload, format="json")
+                self.assertEqual(response.status_code, 201)
+                detail = f"{base}{response.data['id']}/"
+                self.assertEqual(self.client.put(detail, payload, format="json").status_code, 200)
+                self.assertEqual(self.client.patch(detail, payload, format="json").status_code, 200)
+                self.assertEqual(self.client.delete(detail).status_code, 204)
 
 
 @override_settings(ALLOWED_HOSTS=["testserver"])
