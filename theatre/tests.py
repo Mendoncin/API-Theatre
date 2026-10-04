@@ -87,6 +87,65 @@ class CatalogPermissionTests(TestCase):
 
 
 @override_settings(ALLOWED_HOSTS=["testserver"])
+class PerformanceDeletionTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.staff = get_user_model().objects.create_user(
+            username="performance-staff", is_staff=True, is_superuser=False
+        )
+        cls.regular = get_user_model().objects.create_user(username="performance-reader")
+        hall = TheatreHall.objects.create(name="Hall", rows=3, seats_in_row=5)
+        play = Play.objects.create(title="Play", description="Description")
+        cls.performance = Performance.objects.create(
+            play=play, theatre_hall=hall, show_time=timezone.now()
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.staff)
+        self.url = f"/api/theatre/performances/{self.performance.pk}/"
+
+    def test_staff_can_delete_performance_without_reservations(self):
+        response = self.client.delete(self.url)
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Performance.objects.filter(pk=self.performance.pk).exists())
+
+    def test_reserved_performance_returns_conflict_and_preserves_data(self):
+        reservation_ids = []
+        for count in (1, 2):
+            reservation_ids.append(Reservation.objects.create(
+                user=self.regular, performance=self.performance
+            ).pk)
+            with self.subTest(reservations=count):
+                response = self.client.delete(self.url)
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.data, {
+                    "detail": (
+                        "This performance cannot be deleted "
+                        "because it has existing reservations."
+                    )
+                })
+                self.assertTrue(Performance.objects.filter(pk=self.performance.pk).exists())
+                self.assertEqual(
+                    Reservation.objects.filter(
+                        pk__in=reservation_ids, performance=self.performance
+                    ).count(), count,
+                )
+
+    def test_nonstaff_cannot_delete_even_when_performance_is_protected(self):
+        reservation = Reservation.objects.create(
+            user=self.regular, performance=self.performance
+        )
+        for user, expected in ((None, 401), (self.regular, 403)):
+            with self.subTest(user=user):
+                self.client.force_authenticate(user)
+                self.assertEqual(self.client.get(self.url).status_code, 200)
+                self.assertEqual(self.client.delete(self.url).status_code, expected)
+                self.assertTrue(Performance.objects.filter(pk=self.performance.pk).exists())
+                self.assertTrue(Reservation.objects.filter(pk=reservation.pk).exists())
+
+
+@override_settings(ALLOWED_HOSTS=["testserver"])
 class OwnershipEndpointTests(TestCase):
     @classmethod
     def setUpTestData(cls):

@@ -1,4 +1,6 @@
-from rest_framework import mixins, permissions, viewsets
+from django.db.models.deletion import ProtectedError
+from rest_framework import mixins, permissions, status, viewsets
+from rest_framework.response import Response
 
 from theatre.permissions import IsAdminOrReadOnly
 
@@ -50,6 +52,24 @@ class PerformanceViewSet(viewsets.ModelViewSet):
     queryset = Performance.objects.all()
     serializer_class = PerformanceSerializer
     permission_classes = [IsAdminOrReadOnly]
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+
+        try:
+            self.perform_destroy(instance)
+        except ProtectedError:
+            return Response(
+                {
+                    "detail": (
+                        "This performance cannot be deleted "
+                        "because it has existing reservations."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ReservationViewSet(
