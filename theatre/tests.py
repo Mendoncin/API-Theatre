@@ -65,21 +65,19 @@ class CatalogPermissionTests(TestCase):
                     response = self.client.post(f"/api/theatre/{resource}/", payload, format="json")
                     self.assertEqual(response.status_code, expected)
 
-    def test_actor_nonstaff_read_and_write_permissions(self):
-        base = "/api/theatre/actors/"
-        detail = f"{base}{self.actor.pk}/"
-        payload = {"first_name": "Changed", "last_name": "Actor"}
+    def test_catalog_nonstaff_read_and_write_permissions(self):
         for user, expected in ((None, 401), (self.regular, 403)):
             self.client.force_authenticate(user)
-            self.assertEqual(self.client.get(detail).status_code, 200)
-            for method in ("put", "patch", "delete"):
-                with self.subTest(user=user, method=method):
-                    self.assertEqual(
-                        getattr(self.client, method)(detail, payload, format="json").status_code,
-                        expected,
-                    )
-        self.actor.refresh_from_db()
-        self.assertEqual(self.actor.first_name, "Test")
+            for resource, obj, payload in self.resources:
+                detail = f"/api/theatre/{resource}/{obj.pk}/"
+                before = type(obj).objects.values().get(pk=obj.pk)
+                self.assertEqual(self.client.get(detail).status_code, 200)
+                for method in ("put", "patch", "delete"):
+                    with self.subTest(user=user, resource=resource, method=method):
+                        response = getattr(self.client, method)(detail, payload, format="json")
+                        self.assertEqual(response.status_code, expected)
+                        self.assertEqual(set(response.data), {"detail"})
+                        self.assertEqual(type(obj).objects.values().get(pk=obj.pk), before)
 
     def test_staff_without_superuser_can_manage_catalog(self):
         self.client.force_authenticate(self.staff)
@@ -92,7 +90,26 @@ class CatalogPermissionTests(TestCase):
                 detail = f"{base}{response.data['id']}/"
                 self.assertEqual(self.client.put(detail, payload, format="json").status_code, 200)
                 self.assertEqual(self.client.patch(detail, payload, format="json").status_code, 200)
-                self.assertEqual(self.client.delete(detail).status_code, 204)
+                response = self.client.delete(detail)
+                self.assertEqual(response.status_code, 204)
+                self.assertEqual(response.content, b"")
+
+    def test_invalid_catalog_payloads_return_native_field_errors(self):
+        self.client.force_authenticate(self.staff)
+        for resource, _, _ in self.resources:
+            with self.subTest(resource=resource):
+                response = self.client.post(f"/api/theatre/{resource}/", {}, format="json")
+                self.assertEqual(response.status_code, 400)
+                self.assertTrue(response.data)
+                self.assertNotIn("detail", response.data)
+                self.assertTrue(all(isinstance(errors, list) for errors in response.data.values()))
+
+    def test_missing_catalog_details_return_native_404(self):
+        for resource, obj, _ in self.resources:
+            with self.subTest(resource=resource):
+                response = self.client.get(f"/api/theatre/{resource}/{obj.pk + 1}/")
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(set(response.data), {"detail"})
 
 
 @override_settings(ALLOWED_HOSTS=["testserver"])
@@ -407,7 +424,20 @@ class OwnershipEndpointTests(TestCase):
             ):
                 with self.subTest(resource=resource, method=method, url=url):
                     response = getattr(self.client, method)(url)
-                    self.assertIn(response.status_code, (401, 403))
+                    self.assertEqual(response.status_code, 401)
+                    self.assertEqual(set(response.data), {"detail"})
+                    self.assertTrue(response["WWW-Authenticate"].startswith("Bearer"))
+
+    def test_invalid_jwt_returns_401_without_echoing_credentials(self):
+        self.client.force_authenticate(None)
+        credential = "invalid-private-credential"
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {credential}")
+        for resource in ("reservations", "tickets"):
+            with self.subTest(resource=resource):
+                response = self.client.get(f"/api/theatre/{resource}/")
+                self.assertEqual(response.status_code, 401)
+                self.assertIn("detail", response.data)
+                self.assertNotIn(credential, response.content.decode())
 
     def test_lists_details_and_deletes_are_scoped_to_owner(self):
         for resource, own, foreign in (
@@ -420,8 +450,13 @@ class OwnershipEndpointTests(TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual([item["id"] for item in response.data["results"]], [own.pk])
                 self.assertEqual(self.client.get(f"{base}{own.pk}/").status_code, 200)
-                self.assertEqual(self.client.get(f"{base}{foreign.pk}/").status_code, 404)
-                self.assertEqual(self.client.delete(f"{base}{foreign.pk}/").status_code, 404)
+                for method in ("get", "delete"):
+                    foreign_response = getattr(self.client, method)(f"{base}{foreign.pk}/")
+                    missing_response = getattr(self.client, method)(f"{base}{max(own.pk, foreign.pk) + 1}/")
+                    self.assertEqual(foreign_response.status_code, 404)
+                    self.assertEqual(missing_response.status_code, 404)
+                    self.assertEqual(foreign_response.data, missing_response.data)
+                    self.assertEqual(set(foreign_response.data), {"detail"})
                 self.assertTrue(type(foreign).objects.filter(pk=foreign.pk).exists())
 
     def test_update_methods_are_unavailable_and_leave_objects_unchanged(self):
@@ -436,6 +471,7 @@ class OwnershipEndpointTests(TestCase):
                         f"/api/theatre/{resource}/{obj.pk}/", data, format="json"
                     )
                     self.assertEqual(response.status_code, 405)
+                    self.assertEqual(set(response.data), {"detail"})
                     self.assertNotIn("PUT", response["Allow"])
                     self.assertNotIn("PATCH", response["Allow"])
                     self.assertEqual(type(obj).objects.values().get(pk=obj.pk), before)
@@ -449,6 +485,7 @@ class OwnershipEndpointTests(TestCase):
         for resource, obj in (("tickets", self.ticket), ("reservations", self.reservation)):
             response = self.client.delete(f"/api/theatre/{resource}/{obj.pk}/")
             self.assertEqual(response.status_code, 204)
+            self.assertEqual(response.content, b"")
             self.assertFalse(type(obj).objects.filter(pk=obj.pk).exists())
 
     def test_database_constraint_rejects_duplicate_seat(self):
@@ -686,6 +723,7 @@ class ReservationCreationTests(TestCase):
             "performance": self.performance.pk, "row": 2, "seat": 1,
         }, format="json")
         self.assertEqual(response.status_code, 405)
+        self.assertEqual(set(response.data), {"detail"})
         self.assertNotIn("POST", response["Allow"])
         self.assertEqual(self.counts(), before)
 

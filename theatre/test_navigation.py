@@ -59,6 +59,15 @@ class PlayNavigationTests(TestCase):
     def test_search_and_genre_are_combined_with_and(self):
         self.assertEqual(self.ids({"search": "hamlet", "genre": self.drama.pk}), [self.hamlet.pk])
 
+    def test_genre_validation_distinguishes_invalid_syntax_from_missing_id(self):
+        response = self.client.get(self.url, {"genre": "abc"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {"genre": ["Enter a number."]})
+        missing_id = max(self.drama.pk, self.comedy.pk) + 1
+        response = self.client.get(self.url, {"genre": missing_id})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {"count": 0, "next": None, "previous": None, "results": []})
+
     def test_ordering_is_restricted_to_title_and_defaults_to_ascending(self):
         ascending = [self.hamlet.pk, self.romeo.pk, self.tragedy.pk]
         self.assertEqual(self.ids(), ascending)
@@ -67,6 +76,10 @@ class PlayNavigationTests(TestCase):
         for field in ("-id", "description", "genres__name", "actors"):
             with self.subTest(field=field):
                 self.assertEqual(self.ids({"ordering": field}), ascending)
+                response = self.client.get(self.url, {"ordering": field})
+                view = response.renderer_context["view"]
+                # DRF discards unlisted fields; the ORM uses only the default.
+                self.assertEqual(view.filter_queryset(view.get_queryset()).query.order_by, ("title",))
 
     def test_detail_ignores_collection_parameters(self):
         url = f"{self.hamlet.pk}/"
@@ -135,11 +148,20 @@ class PerformanceNavigationTests(TestCase):
         self.assertEqual(self.ids({"date": "2026-12-19"}), [self.past.pk])
 
     def test_date_rejects_visual_formats_and_invalid_dates(self):
-        for value in ("20/12/2026", "12/20/2026", "Dec 20, 2026", "2026-02-30"):
+        for value in ("20/12/2026", "12/20/2026", "Dec 20, 2026", "2026-02-30", "2026-99-83"):
             with self.subTest(value=value):
                 response = self.client.get(self.url, {"date": value})
                 self.assertEqual(response.status_code, 400)
-                self.assertIn("date", response.data)
+                self.assertEqual(response.data, {"date": ["Enter a valid date."]})
+
+    def test_play_validation_distinguishes_invalid_syntax_from_missing_id(self):
+        response = self.client.get(self.url, {"play": "abc"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {"play": ["Enter a number."]})
+        missing_id = max(self.play.pk, self.other_play.pk) + 1
+        response = self.client.get(self.url, {"play": missing_id})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {"count": 0, "next": None, "previous": None, "results": []})
 
     def test_date_uses_django_active_timezone(self):
         boundary = self.make_performance(
@@ -148,13 +170,21 @@ class PerformanceNavigationTests(TestCase):
         with timezone.override(ZoneInfo("America/Bahia")):
             self.assertEqual(self.ids({"date": "2026-12-19"}), [self.past.pk, boundary.pk])
 
-    def test_upcoming_is_strictly_future_and_false_does_not_filter(self):
+    def test_upcoming_splits_future_from_started_and_absent_returns_all(self):
         all_ids = [self.past.pk, self.exact_start.pk, self.future_a.pk, self.future_b.pk, self.tomorrow.pk]
         self.assertEqual(self.ids(), all_ids)
-        self.assertEqual(self.ids({"upcoming": "false"}), all_ids)
+        self.assertEqual(self.ids({"upcoming": "false"}), [self.past.pk, self.exact_start.pk])
         self.assertEqual(self.ids({"upcoming": "true"}), [
             self.future_a.pk, self.future_b.pk, self.tomorrow.pk,
         ])
+
+    def test_upcoming_rejects_values_outside_documented_choices(self):
+        for value in ("banana", "1", "0", "TRUE", "False"):
+            with self.subTest(value=value):
+                response = self.client.get(self.url, {"upcoming": value})
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(set(response.data), {"upcoming"})
+                self.assertEqual(response.data["upcoming"][0].code, "invalid_choice")
 
     def test_filters_are_cumulative(self):
         self.assertEqual(self.ids({"play": self.play.pk, "date": "2026-12-20"}), [
@@ -166,6 +196,9 @@ class PerformanceNavigationTests(TestCase):
         self.assertEqual(self.ids({
             "play": self.play.pk, "date": "2026-12-20", "upcoming": "true",
         }), [self.future_a.pk])
+        self.assertEqual(self.ids({
+            "play": self.play.pk, "date": "2026-12-20", "upcoming": "false",
+        }), [self.exact_start.pk])
 
     def test_ordering_is_restricted_to_show_time_and_defaults_to_ascending(self):
         ascending = [self.past.pk, self.exact_start.pk, self.future_a.pk, self.future_b.pk, self.tomorrow.pk]
@@ -175,6 +208,9 @@ class PerformanceNavigationTests(TestCase):
         for field in ("-id", "play", "theatre_hall", "play__title"):
             with self.subTest(field=field):
                 self.assertEqual(self.ids({"ordering": field}), ascending)
+                response = self.client.get(self.url, {"ordering": field})
+                view = response.renderer_context["view"]
+                self.assertEqual(view.filter_queryset(view.get_queryset()).query.order_by, ("show_time",))
 
     def test_search_and_unrequested_filters_are_ignored(self):
         self.assertEqual(self.ids({
@@ -277,6 +313,23 @@ class CollectionPaginationTests(TestCase):
         for value in (1, 100, 0):
             with self.subTest(value=value):
                 self.assert_pages("/api/theatre/plays/", {"page_size": value})
+
+    def test_nonexistent_and_malformed_pages_keep_native_404(self):
+        for page in ("999999", "abc", "0", "-1"):
+            with self.subTest(page=page):
+                response = self.client.get("/api/theatre/plays/", {"page": page})
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(response.data, {"detail": "Invalid page."})
+
+    def test_details_are_direct_objects_for_all_seven_resources(self):
+        for resource in ("actors", "genres", "halls", "plays", "performances", "reservations", "tickets"):
+            with self.subTest(resource=resource):
+                listing = self.client.get(f"/api/theatre/{resource}/")
+                pk = listing.data["results"][0]["id"]
+                detail = self.client.get(f"/api/theatre/{resource}/{pk}/")
+                self.assertEqual(detail.status_code, 200)
+                self.assertEqual(detail.data["id"], pk)
+                self.assertTrue({"count", "next", "previous", "results"}.isdisjoint(detail.data))
 
     def test_play_search_and_genre_filter_before_pagination(self):
         Play.objects.create(title="Play excluded", description="Description")

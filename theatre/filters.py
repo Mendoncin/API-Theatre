@@ -17,13 +17,16 @@ class PerformanceFilter(filters.FilterSet):
     date = filters.DateFilter(
         field_name="show_time", lookup_expr="date", input_formats=["%Y-%m-%d"],
     )
-    upcoming = filters.BooleanFilter(method="filter_upcoming")
+    upcoming = filters.ChoiceFilter(
+        choices=[("true", "true"), ("false", "false")],
+        method="filter_upcoming",
+    )
 
     class Meta:
         model = Performance
         fields = []
 
     def filter_upcoming(self, queryset, name, value):
-        if value:
+        if value == "true":
             return queryset.filter(show_time__gt=timezone.now())
-        return queryset
+        return queryset.filter(show_time__lte=timezone.now())
