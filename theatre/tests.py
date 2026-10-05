@@ -140,7 +140,7 @@ class RepresentationTests(TestCase):
         }
         response = self.client.get("/api/theatre/plays/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data, [summary])
+        self.assertEqual(response.data["results"], [summary])
         response = self.client.get(f"/api/theatre/plays/{self.performance.play_id}/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data, {
@@ -151,10 +151,10 @@ class RepresentationTests(TestCase):
     def test_performance_list_and_detail_share_summary_representation(self):
         response = self.client.get("/api/theatre/performances/")
         self.assertEqual(response.status_code, 200)
-        self.assert_performance_representation(response.data[0])
+        self.assert_performance_representation(response.data["results"][0])
         detail = self.client.get(f"/api/theatre/performances/{self.performance.pk}/")
         self.assertEqual(detail.status_code, 200)
-        self.assertEqual(detail.data, response.data[0])
+        self.assertEqual(detail.data, response.data["results"][0])
 
     def test_reservation_create_list_and_detail_use_enriched_read_representation(self):
         self.client.force_authenticate(self.owner)
@@ -173,8 +173,8 @@ class RepresentationTests(TestCase):
         self.assertEqual(detail.data, data)
         listing = self.client.get("/api/theatre/reservations/")
         self.assertEqual(listing.status_code, 200)
-        self.assertIn(data, listing.data)
-        for item in listing.data:
+        self.assertIn(data, listing.data["results"])
+        for item in listing.data["results"]:
             self.assert_performance_representation(item["performance"])
             self.assertTrue(item["tickets"])
             self.assertEqual(set(item["tickets"][0]), {"id", "row", "seat"})
@@ -229,8 +229,13 @@ class RepresentationTests(TestCase):
                     with CaptureQueriesContext(connection) as queries:
                         response = self.client.get(f"/api/theatre/{resource}/")
                     self.assertEqual(response.status_code, 200)
-                    self.assertEqual(len(response.data), count)
-                    self.assertEqual(len(queries), expected, [q["sql"] for q in queries])
+                    self.assertEqual(len(response.data["results"]), count)
+                    # Pagination adds exactly one COUNT; data queries stay constant.
+                    count_queries = [q for q in queries if 'COUNT(' in q['sql'].upper()]
+                    self.assertEqual(len(count_queries), 1)
+                    self.assertEqual(response.data["count"], count)
+                    self.assertEqual(len(queries) - len(count_queries), expected,
+                                     [q["sql"] for q in queries])
 
 
 @override_settings(ALLOWED_HOSTS=["testserver"])
@@ -413,7 +418,7 @@ class OwnershipEndpointTests(TestCase):
             with self.subTest(resource=resource):
                 response = self.client.get(base)
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual([item["id"] for item in response.data], [own.pk])
+                self.assertEqual([item["id"] for item in response.data["results"]], [own.pk])
                 self.assertEqual(self.client.get(f"{base}{own.pk}/").status_code, 200)
                 self.assertEqual(self.client.get(f"{base}{foreign.pk}/").status_code, 404)
                 self.assertEqual(self.client.delete(f"{base}{foreign.pk}/").status_code, 404)
@@ -532,7 +537,7 @@ class ReservationCreationTests(TestCase):
         self.assertEqual(set(response.data), {"id", "created_at", "user", "performance", "tickets"})
         self.assertEqual(response.data["tickets"], [{"id": ticket.pk, "row": 2, "seat": 1}])
         self.assertEqual(self.client.get(f"{self.url}{reservation.pk}/").data, response.data)
-        self.assertEqual(self.client.get(self.url).data, [response.data])
+        self.assertEqual(self.client.get(self.url).data["results"], [response.data])
 
     def test_past_performance_rejects_reservation_without_writes(self):
         self.performance.show_time = timezone.now() - timedelta(days=1)
@@ -745,7 +750,7 @@ class PerformanceAvailabilityTests(TestCase):
         self.assertEqual(detail.data["id"], self.performance.pk)
         listing = self.client.get("/api/theatre/performances/")
         self.assertEqual(listing.status_code, 200)
-        self.assertIn(self.performance.pk, [item["id"] for item in listing.data])
+        self.assertIn(self.performance.pk, [item["id"] for item in listing.data["results"]])
 
     def test_tickets_from_multiple_reservations_are_sorted_without_changing_data(self):
         self.add_tickets(self.performance, [(4, 8), (1, 7), (2, 2)])
@@ -909,7 +914,7 @@ class CancellationTests(TransactionTestCase):
                         self.assertEqual(self.client.get(url).status_code, 200)
                         listing = self.client.get(f"/api/theatre/{resource}/")
                         self.assertEqual(listing.status_code, 200)
-                        self.assertIn(pk, [item["id"] for item in listing.data])
+                        self.assertIn(pk, [item["id"] for item in listing.data["results"]])
 
     def test_last_ticket_deletion_rolls_back_if_reservation_deletion_fails(self):
         reservation, tickets = self.make_reservation(1)

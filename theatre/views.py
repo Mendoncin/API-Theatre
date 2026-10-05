@@ -2,11 +2,13 @@ from django.db import transaction
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import mixins, permissions, status, viewsets
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters, mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from theatre.exceptions import CancellationNotAllowed
+from theatre.filters import PerformanceFilter, PlayFilter
 from theatre.permissions import IsAdminOrReadOnly
 
 from theatre.models import (
@@ -53,19 +55,19 @@ class ProtectedDeleteMixin:
 
 
 class ActorViewSet(viewsets.ModelViewSet):
-    queryset = Actor.objects.all()
+    queryset = Actor.objects.order_by("pk")
     serializer_class = ActorSerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
 class GenreViewSet(viewsets.ModelViewSet):
-    queryset = Genre.objects.all()
+    queryset = Genre.objects.order_by("pk")
     serializer_class = GenreSerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
 class TheatreHallViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
-    queryset = TheatreHall.objects.all()
+    queryset = TheatreHall.objects.order_by("pk")
     serializer_class = TheatreHallSerializer
     permission_classes = [IsAdminOrReadOnly]
 
@@ -74,6 +76,17 @@ class PlayViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Play.objects.all()
     serializer_class = PlayWriteSerializer
     permission_classes = [IsAdminOrReadOnly]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = PlayFilter
+    search_fields = ["title"]
+    ordering_fields = ["title"]
+    ordering = ["title"]
+
+    def filter_queryset(self, queryset):
+        # Collection parameters must not affect detail or write actions.
+        if self.action == "list":
+            return super().filter_queryset(queryset)
+        return queryset
 
     def get_serializer_class(self):
         if self.action == "list":
@@ -95,6 +108,16 @@ class PerformanceViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Performance.objects.all()
     serializer_class = PerformanceSerializer
     permission_classes = [IsAdminOrReadOnly]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_class = PerformanceFilter
+    ordering_fields = ["show_time"]
+    ordering = ["show_time"]
+
+    def filter_queryset(self, queryset):
+        # In particular, availability must ignore collection parameters.
+        if self.action == "list":
+            return super().filter_queryset(queryset)
+        return queryset
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -151,7 +174,7 @@ class ReservationViewSet(
     def get_queryset(self):
         return Reservation.objects.filter(user=self.request.user).select_related(
             "performance__play", "performance__theatre_hall",
-        ).prefetch_related("tickets")
+        ).prefetch_related("tickets").order_by("pk")
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -186,7 +209,7 @@ class TicketViewSet(
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return Ticket.objects.filter(reservation__user=self.request.user)
+        return Ticket.objects.filter(reservation__user=self.request.user).order_by("pk")
 
     def perform_destroy(self, instance):
         with transaction.atomic():
