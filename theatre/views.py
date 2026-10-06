@@ -3,6 +3,9 @@ from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import (
+    OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view,
+)
 from rest_framework import filters, mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -10,6 +13,7 @@ from rest_framework.response import Response
 from theatre.exceptions import CancellationNotAllowed
 from theatre.filters import PerformanceFilter, PlayFilter
 from theatre.permissions import IsAdminOrReadOnly
+from theatre.schema import DetailErrorSerializer, PerformanceAvailabilitySerializer
 
 from theatre.models import (
     Actor,
@@ -40,6 +44,13 @@ class ProtectedDeleteMixin:
         "This resource cannot be deleted because it has protected related data."
     )
 
+    @extend_schema(responses={
+        204: None,
+        409: OpenApiResponse(
+            DetailErrorSerializer,
+            description="This resource has protected related data.",
+        ),
+    })
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
 
@@ -54,24 +65,28 @@ class ProtectedDeleteMixin:
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+@extend_schema(auth=[], methods=["GET"])
 class ActorViewSet(viewsets.ModelViewSet):
     queryset = Actor.objects.order_by("pk")
     serializer_class = ActorSerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
+@extend_schema(auth=[], methods=["GET"])
 class GenreViewSet(viewsets.ModelViewSet):
     queryset = Genre.objects.order_by("pk")
     serializer_class = GenreSerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
+@extend_schema(auth=[], methods=["GET"])
 class TheatreHallViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = TheatreHall.objects.order_by("pk")
     serializer_class = TheatreHallSerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
+@extend_schema(auth=[], methods=["GET"])
 class PlayViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Play.objects.all()
     serializer_class = PlayWriteSerializer
@@ -104,6 +119,16 @@ class PlayViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
         return queryset
 
 
+@extend_schema(auth=[], methods=["GET"])
+@extend_schema_view(list=extend_schema(parameters=[
+    OpenApiParameter(
+        "upcoming", bool,
+        description=(
+            "Use true for future performances, false for started/past performances; "
+            "omit for all. Only lowercase true and false are accepted."
+        ),
+    ),
+]))
 class PerformanceViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
     queryset = Performance.objects.all()
     serializer_class = PerformanceSerializer
@@ -130,6 +155,14 @@ class PerformanceViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
             return queryset.select_related("play", "theatre_hall")
         return queryset
 
+    @extend_schema(
+        responses=PerformanceAvailabilitySerializer,
+        description=(
+            "Returns a snapshot of the current seat occupancy for this performance. "
+            "Availability does not guarantee that a seat will remain available "
+            "until reservation creation."
+        ),
+    )
     @action(detail=True, methods=["get"], url_path="availability")
     def availability(self, request, pk=None):
         performance = self.get_object()
@@ -156,6 +189,19 @@ class PerformanceViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
         })
 
 
+@extend_schema_view(
+    retrieve=extend_schema(parameters=[OpenApiParameter("id", int, OpenApiParameter.PATH)]),
+    destroy=extend_schema(
+        parameters=[OpenApiParameter("id", int, OpenApiParameter.PATH)],
+        responses={
+            204: None,
+            409: OpenApiResponse(
+                DetailErrorSerializer,
+                description="Cancellation is allowed only before the performance starts.",
+            ),
+        },
+    ),
+)
 class ReservationViewSet(
     mixins.CreateModelMixin,
     mixins.ListModelMixin,
@@ -176,6 +222,20 @@ class ReservationViewSet(
             "performance__play", "performance__theatre_hall",
         ).prefetch_related("tickets").order_by("pk")
 
+    @extend_schema(
+        request=ReservationCreateSerializer,
+        responses={
+            201: ReservationSerializer,
+            409: OpenApiResponse(
+                DetailErrorSerializer,
+                description="One or more seats are unavailable, including concurrency conflicts.",
+            ),
+        },
+        description=(
+            "Creates a reservation and all requested tickets atomically. "
+            "The user comes from authentication."
+        ),
+    )
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -199,6 +259,19 @@ class ReservationViewSet(
             reservation.delete()
 
 
+@extend_schema_view(
+    retrieve=extend_schema(parameters=[OpenApiParameter("id", int, OpenApiParameter.PATH)]),
+    destroy=extend_schema(
+        parameters=[OpenApiParameter("id", int, OpenApiParameter.PATH)],
+        responses={
+            204: None,
+            409: OpenApiResponse(
+                DetailErrorSerializer,
+                description="Cancellation is allowed only before the performance starts.",
+            ),
+        },
+    ),
+)
 class TicketViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
