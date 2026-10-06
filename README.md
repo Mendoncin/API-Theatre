@@ -26,7 +26,7 @@ A REST API for a theatre reservation system, built as a backend portfolio projec
 | django-filter | Catalogue filtering |
 | drf-spectacular | OpenAPI schema and Swagger UI |
 
-Dependency versions are defined in `requirements.txt`. Docker and Docker Compose are planned as the final infrastructure step.
+Dependency versions are defined in `requirements.txt`. For a development environment without installing Python or PostgreSQL locally, see [Docker](#docker).
 
 ## Domain Model
 
@@ -205,9 +205,9 @@ python -m pip install -r requirements.txt
 
 ### 4. Configure PostgreSQL and application settings
 
-Create a PostgreSQL database and a local database user. Configure the connection used by `config/settings.py`: database name, user, password, host, and port. Supply any environment values that the settings read before starting Django.
+Create a PostgreSQL database and a local database user. Copy `.env.example` to `.env`, set a new `SECRET_KEY`, and configure your local database credentials. For host execution, change `DB_HOST` to `localhost` and set `DB_PORT` to your local PostgreSQL port.
 
-Keep local credentials out of version control. The configuration source is `config/settings.py`; use the environment variable names and loading mechanism implemented there.
+`python-dotenv` loads `.env`; existing process environment variables take precedence. Keep local credentials out of version control. The host database and the Docker database are independent.
 
 ### 5. Apply migrations
 
@@ -231,9 +231,20 @@ Open [Swagger UI](http://127.0.0.1:8000/api/docs/) to explore the API. Use a sta
 
 ## Environment Variables
 
-Environment configuration is defined by `config/settings.py`. Configure the values consumed there for your local environment before running migrations or starting the server.
+Use [`.env.example`](.env.example) as the configuration template. `.env` and local `.env.*` files are ignored by Git and excluded from the Docker image.
 
-<!-- Before publishing: replace this paragraph with a table of the environment variables actually read by config/settings.py, their purposes, and whether they are required. Link .env.example only after that file exists and its loading mechanism has been verified. Do not invent SECRET_KEY, DEBUG, DATABASE_URL, or DB_* variable names. -->
+| Variable | Purpose / default |
+| --- | --- |
+| `SECRET_KEY` | Required Django signing key; supply a new value for your environment. |
+| `DEBUG` | Defaults to false; `1`, `true`, and `yes` enable it, case-insensitively. |
+| `ALLOWED_HOSTS` | Comma-separated hosts; defaults to `localhost,127.0.0.1`. |
+| `DB_NAME` | PostgreSQL database name. |
+| `DB_USER` | PostgreSQL user. |
+| `DB_PASSWORD` | PostgreSQL password. |
+| `DB_HOST` | Defaults to `localhost` outside Docker; Compose sets `db`. |
+| `DB_PORT` | Defaults to `5432`; Compose sets `5432`. |
+
+Compose maps the same `DB_NAME`, `DB_USER`, and `DB_PASSWORD` values to PostgreSQL's initialization variables. These initialize a new volume; changing them later does not update credentials in an existing database.
 
 ## Database
 
@@ -251,7 +262,7 @@ The database user must have permission to create Django's test database.
 
 The suite covers authentication, ownership, staff permissions, reservation validation, availability, concurrent operations, atomicity, cancellation, catalogue filters, pagination, OpenAPI contracts, and protected deletions.
 
-**Latest recorded project run: 98 tests passing.** This is a test result, not a measured code coverage percentage.
+**Latest recorded Docker run: 98 tests passing, no skips, on Linux and PostgreSQL 18.6.** This includes the PostgreSQL concurrency tests. This is a test result, not a measured code coverage percentage.
 
 ## Technical Decisions
 
@@ -282,4 +293,63 @@ A dedicated frontend, ticket pricing, payments, payment gateway integrations, an
 
 ## Docker
 
-**Planned.** Docker and Docker Compose will provide a reproducible environment for Django and PostgreSQL. Container startup instructions will be added after the setup has been implemented and verified.
+Prerequisites: Docker and Docker Compose, with the Docker engine running in Linux container mode. Local Python and PostgreSQL installations are not required.
+
+After cloning the repository and entering its directory, create the local configuration:
+
+```bash
+cp .env.example .env
+```
+
+In Windows PowerShell, use `Copy-Item .env.example .env`. Keep an existing `.env` if you already have one and review its values instead of overwriting it. Replace the placeholder `SECRET_KEY` and `DB_PASSWORD` with new development-only values; keep `DEBUG=True`. Do not commit `.env`.
+
+Build and start the two services:
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+PostgreSQL must pass its `pg_isready` healthcheck before Django starts. The web service automatically applies existing migrations, then starts `runserver` on `0.0.0.0:8000`. If migrations fail, the server does not start. No migrations or superusers are generated automatically.
+
+| Service | URL |
+| --- | --- |
+| Theatre API root | http://localhost:8000/api/theatre/ |
+| Swagger UI | http://localhost:8000/api/docs/ |
+| OpenAPI schema | http://localhost:8000/api/schema/ |
+| Admin | http://localhost:8000/admin/ |
+
+The initial database is empty. Create a superuser interactively, then use Admin to populate the catalogue:
+
+```bash
+docker compose exec web python manage.py createsuperuser
+```
+
+Operational commands:
+
+```bash
+docker compose logs web db
+docker compose exec web python manage.py check
+docker compose exec web python manage.py migrate
+docker compose exec web python manage.py test
+```
+
+The manual `migrate` command is available when needed; it is not required after every startup. Tests run inside the Linux Django container against PostgreSQL, including concurrency tests.
+
+Code is copied into the image, without a bind mount. After changing code or dependencies, run `docker compose up -d --build` again. This setup deliberately uses Django's development server and is not a production deployment.
+
+Stop the environment:
+
+```bash
+docker compose down
+```
+
+This removes containers and the network but preserves database data in the named `postgres_data` volume. PostgreSQL is available internally at `db:5432`; its port is not published to the host. The volume is independent of any local PostgreSQL installation.
+
+To deliberately reset the Docker database:
+
+```bash
+docker compose down -v
+```
+
+**This also removes the PostgreSQL volume and its data.** The next `docker compose up -d --build` creates an empty database and reapplies the existing migrations.
